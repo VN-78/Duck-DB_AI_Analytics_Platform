@@ -2,7 +2,8 @@
 from mcp.server.fastmcp import FastMCP
 import uuid
 from pathlib import Path
-from typing import Dict, List, Any
+# from typing import Dict, List, Any
+import json
 
 # Domain And Infrastructure imports
 from data_refinery.domain.models.dataset import DatasetOverview
@@ -144,7 +145,7 @@ def clean_dataset(file_uri: str, options: CleaningOptions) -> CleaningResponse:
             output_path = f"{base_uri}/{output_filename}"
         else:
             # Ensure the directory exists (using your configured temp path)
-            output_path = str(Path("/home/vn-78/VN_78/Programming/Personal/Projects/Final-Year-Project/Entropy/test/temp") / output_filename)
+            output_path = str(Path("/home/vn-78/Projects/code/Entropy/test/temp") / output_filename)
         
         # Save using the smart client
         client.save_dataframe(cleaned_df, output_path)
@@ -158,8 +159,6 @@ def clean_dataset(file_uri: str, options: CleaningOptions) -> CleaningResponse:
 
     except Exception as e:
         raise RuntimeError(f"Cleaning Failed: {str(e)}")
-
-import json
 
 # region generate_visualization
 @mcp.tool()
