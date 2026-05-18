@@ -2,34 +2,29 @@
 import duckdb
 import uuid
 import os
+import logging
 from pathlib import Path
 from typing import Dict, List, Any
 
 # model imports 
 from data_refinery.domain.models.sql import SQLQueryResponse
 
+logger = logging.getLogger(__name__)
+
 # region DuckDB client
 class DuckDBClient:
     """
     Infrastructure service for executing SQL transformations.
-
-    Responsibilities:
-    1. Execute SQL queries safely.
-    2. Manage the lifecycle of result artifacts (files).
-    3. Map raw database results to Domain Models.
     """
 
-    def __init__(self, artifact_dir: str = "/home/vn-78/VN_78/Programming/Personal/Projects/Final-Year-Project/Entropy/test/temp"):
+    def __init__(self, artifact_dir: str = "/home/vn-78/Projects/code/Entropy/test/temp"):
         """
-        Ensures that an folder is availabe to store the Generated file
-        
-        Args:
-            artifact_dir: Where we save the results of queries.
+        Ensures that a folder is available to store the Generated file.
         """
         self.artifact_path = Path(artifact_dir)
-        # Ensure the directory exists; fail loudly if we don't have permissions
         try:
             self.artifact_path.mkdir(parents=True, exist_ok=True)
+            logger.info(f"DuckDB artifact directory set to: {artifact_dir}")
         except PermissionError:
             raise RuntimeError(f"Critical: Cannot write to artifact directory: {artifact_dir}")
 
@@ -39,86 +34,65 @@ class DuckDBClient:
         key = os.environ.get("S3_ACCESS_KEY")
         secret = os.environ.get("S3_SECRET_KEY")
         
+        logger.info(f"Configuring S3 for DuckDB. Endpoint: {endpoint}")
+        
         if endpoint and key and secret:
             try:
                 # Install/Load httpfs extension for S3 support
                 conn.execute("INSTALL httpfs; LOAD httpfs;")
                 
                 # Configure S3/MinIO
-                conn.execute(f"SET s3_endpoint='{endpoint.replace('http://', '').replace('https://', '')}';")
+                # Strip http/https from endpoint as DuckDB s3_endpoint expects just the host:port
+                stripped_endpoint = endpoint.replace('http://', '').replace('https://', '')
+                conn.execute(f"SET s3_endpoint='{stripped_endpoint}';")
                 conn.execute(f"SET s3_access_key_id='{key}';")
                 conn.execute(f"SET s3_secret_access_key='{secret}';")
                 conn.execute("SET s3_url_style='path';")
-                conn.execute("SET s3_use_ssl=false;") # Assumes local MinIO without SSL
+                conn.execute("SET s3_use_ssl=false;")
+                logger.info("S3 configuration applied successfully to DuckDB connection.")
             except Exception as e:
-                # Log or ignore if extension fails? Better to warn.
-                print(f"Warning: Failed to configure S3 for DuckDB: {e}")
+                logger.error(f"Failed to configure S3 for DuckDB: {e}")
+        else:
+            logger.warning("S3 credentials or endpoint missing from environment. S3 access will fail.")
+
+    def _make_serializable(self, obj: Any) -> Any:
+        """Helper to convert non-serializable objects (like date/datetime) to strings."""
+        import datetime
+        if isinstance(obj, (datetime.date, datetime.datetime)):
+            return obj.isoformat()
+        if isinstance(obj, list):
+            return [self._make_serializable(item) for item in obj]
+        if isinstance(obj, dict):
+            return {k: self._make_serializable(v) for k, v in obj.items()}
+        return obj
 
     def execute_and_write(self, sql_query: str) -> SQLQueryResponse:
         """
         Executes a SQL query and materializes the result to a Parquet file.
-
-        This method creates an ephemeral DuckDB connection to run the provided
-        SQL query. It calculates metadata (row/column counts), samples the data,
-        and saves the full result set to the configured artifact directory.
-
-        Args:
-            sql_query: A raw SQL query string. Must use valid DuckDB syntax
-            and reference files directly (e.g., "SELECT * FROM 'file.csv'").
-
-        Returns:
-            SQLQueryResponse: An object containing execution status, metadata
-            (row/column counts), sample data, and the URI of the saved
-            Parquet file.
-
-        Raises:
-            ValueError: If the SQL syntax is malformed.
-            FileNotFoundError: If the query references a file or table that
-            does not exist.
-            RuntimeError: If an unexpected error occurs during execution or
-            file writing.
         """
-        # 1. Ephemeral Connection
-        # We create a new connection per request to ensure isolation.
-        # DuckDB handles this very cheaply.
+        logger.info(f"Executing SQL: {sql_query}")
         conn = duckdb.connect(database=':memory:')
-        
-        # Configure S3 if needed
         self._configure_s3(conn)
 
         try:
-            # 2. Lazy Execution
-            # conn.sql() creates a "Relation" - it validates syntax but 
-            # doesn't load all data into Python memory yet.
             relation = conn.sql(sql_query)
-
-            # 3. Validation (The "Peek" Phase)
-            # We fetch basic stats immediately. 
-            # Note: For massive data, count() is expensive, but necessary here.
             row_count = relation.shape[0]
             col_count = relation.shape[1]
             columns = relation.columns
 
-            # 4. Sampling
-            # limit(5) ensures we only fetch 5 rows into Python memory
             sample_rows = relation.limit(5).fetchall()
-            
-            # Convert tuples [('Value', 10), ...] to Dicts [{'col': 'Value', ...}]
-            # This is required because Pydantic expects List[Dict]
+            # Ensure sample data is serializable
             sample_data: List[Dict[str, Any]] = [
-                dict(zip(columns, row)) for row in sample_rows
+                self._make_serializable(dict(zip(columns, row))) for row in sample_rows
             ]
 
-            # 5. Materialization (The "Write" Phase)
-            # Generate a unique ID for this result artifact
             file_id = uuid.uuid4().hex[:8]
             output_filename = f"result_{file_id}.parquet"
             output_uri = self.artifact_path / output_filename
 
-            # Write to Parquet (High performance, type-safe)
             relation.write_parquet(str(output_uri))
+            logger.info(f"Query successful. Result written to: {output_uri}")
 
-            # 6. Return the Contract
             return SQLQueryResponse(
                 status=True,
                 total_rows=row_count,
@@ -128,14 +102,47 @@ class DuckDBClient:
             )
 
         except duckdb.ParserException as e:
-            # Malformed SQL
+            logger.error(f"SQL Syntax Error: {e}")
             raise ValueError(f"SQL Syntax Error: {str(e)}")
         except duckdb.CatalogException as e:
-            # Missing file or table
+            logger.error(f"Data Access Error (Catalog): {e}")
             raise FileNotFoundError(f"Data Access Error: {str(e)}")
         except Exception as e:
-            # Catch-all for unexpected system failures
+            logger.error(f"Unexpected error during SQL execution: {e}")
             raise RuntimeError(f"Execution Failed: {str(e)}")
         finally:
-            # Clean up the connection to free memory
+            conn.close()
+
+    def query_preview(self, file_uri: str, limit: int = 10, offset: int = 0) -> Dict[str, Any]:
+        """
+        Queries a portion of a dataset for preview purposes.
+        """
+        logger.info(f"Fetching preview for: {file_uri} (limit={limit}, offset={offset})")
+        conn = duckdb.connect(database=':memory:')
+        self._configure_s3(conn)
+        
+        try:
+            sql = f"SELECT * FROM '{file_uri}' LIMIT {limit} OFFSET {offset}"
+            relation = conn.sql(sql)
+            
+            columns = relation.columns
+            rows = relation.fetchall()
+            
+            total_count = conn.sql(f"SELECT count(*) FROM '{file_uri}'").fetchone()[0]
+            
+            # Ensure data is serializable
+            data = [self._make_serializable(dict(zip(columns, row))) for row in rows]
+            logger.info(f"Preview successful. Retrieved {len(data)} rows.")
+            
+            return {
+                "columns": columns,
+                "data": data,
+                "total_rows": total_count,
+                "limit": limit,
+                "offset": offset
+            }
+        except Exception as e:
+            logger.error(f"Preview failed for {file_uri}: {e}")
+            raise
+        finally:
             conn.close()

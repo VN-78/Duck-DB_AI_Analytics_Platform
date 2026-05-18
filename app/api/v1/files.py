@@ -1,6 +1,8 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Query
 from app.services.storage import storage_service
+from app.services.mcp_client import data_refinery_mcp
 import uuid
+import json
 
 router = APIRouter()
 
@@ -25,3 +27,23 @@ async def upload_file(file: UploadFile = File(...)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/preview")
+async def preview_file(
+    uri: str = Query(...),
+    limit: int = Query(10),
+    offset: int = Query(0)
+):
+    """
+    Returns a paginated preview of the file data using DuckDB via MCP.
+    """
+    try:
+        result = await data_refinery_mcp.call_tool(
+            "preview_dataset", 
+            {"file_uri": uri, "limit": limit, "offset": offset}
+        )
+        # FastMCP might return the tool output differently depending on if it's content list or string
+        # If it's the raw string from server.py (which returns json.dumps), we parse it once.
+        return json.loads(result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch preview: {str(e)}")

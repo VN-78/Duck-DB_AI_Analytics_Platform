@@ -1,14 +1,17 @@
 # region imports
 import pandas as pd
-import io
+# import io
 import os
-from typing import Any, Tuple, Optional
-from urllib.parse import urlparse
+import logging
+from typing import Any, Tuple, Optional, List, Dict, cast
+# from urllib.parse import urlparse
 
 # Domain Imports
 from data_refinery.domain.interfaces.repository import IDatasetRepository
 from data_refinery.domain.models.dataset import DatasetOverview, ColumnProfile
 from data_refinery.domain.models.cleaning import CleaningOptions
+
+logger = logging.getLogger(__name__)
 
 # region load_data  
 class PandasDatasetClient(IDatasetRepository):
@@ -16,43 +19,60 @@ class PandasDatasetClient(IDatasetRepository):
     Implementation to load Data from both local files and S3 URLs using pandas as the engine
     """
     
-    def _get_storage_options(self) -> Optional[dict]:
+    def _get_storage_options(self) -> Optional[Dict[str, Any]]:
         """Returns storage options for s3fs/boto3 if S3 config is present in env."""
         endpoint = os.environ.get("S3_ENDPOINT_URL")
         key = os.environ.get("S3_ACCESS_KEY")
         secret = os.environ.get("S3_SECRET_KEY")
         
         if endpoint and key and secret:
+            logger.info(f"Setting storage options for S3. Endpoint: {endpoint}")
             return {
                 "client_kwargs": {"endpoint_url": endpoint},
                 "key": key,
                 "secret": secret
             }
+        logger.warning("S3 environment variables missing. Storage options not set.")
         return None
 
-    def load_data(self, file_uri) -> pd.DataFrame:
+    def load_data(self, file_uri: str) -> pd.DataFrame:
         """
         Smart loader: checks if URI is S3 or Local, and handles CSV or Parquet.
         """
+        logger.info(f"Pandas loading data from: {file_uri}")
         storage_opts = self._get_storage_options() if file_uri.startswith("s3://") else None
         
-        if file_uri.endswith(".parquet"):
-            return pd.read_parquet(file_uri, storage_options=storage_opts)
-        else:
-            # Default to CSV
-            return pd.read_csv(file_uri, storage_options=storage_opts)
+        try:
+            if file_uri.endswith(".parquet"):
+                df = pd.read_parquet(file_uri, storage_options=storage_opts)
+            else:
+                # Default to CSV
+                df = pd.read_csv(file_uri, storage_options=storage_opts)
+            
+            logger.info(f"Successfully loaded {len(df)} rows from {file_uri}")
+            return df
+        except Exception as e:
+            logger.error(f"Pandas failed to load {file_uri}: {e}")
+            raise
 
-    def save_dataframe(self, df: pd.DataFrame, file_uri: str):
+    def save_dataframe(self, df: pd.DataFrame, file_uri: str) -> None:
         """
         Smart saver: saves to local or S3 based on URI.
         """
-        if file_uri.startswith("s3://"):
-            storage_opts = self._get_storage_options()
-            df.to_parquet(file_uri, storage_options=storage_opts)
-        else:
-            # Ensure parent dir exists for local files
-            os.makedirs(os.path.dirname(file_uri), exist_ok=True)
-            df.to_parquet(file_uri)
+        logger.info(f"Saving dataframe ({len(df)} rows) to: {file_uri}")
+        try:
+            if file_uri.startswith("s3://"):
+                storage_opts = self._get_storage_options()
+                df.to_parquet(file_uri, storage_options=storage_opts)
+            else:
+                # Ensure parent dir exists for local files
+                os.makedirs(os.path.dirname(file_uri), exist_ok=True)
+                df.to_parquet(file_uri)
+            logger.info(f"Successfully saved file to {file_uri}")
+        except Exception as e:
+            logger.error(f"Failed to save file to {file_uri}: {e}")
+            raise
+# endregion
 
 # region analyze data 
 
@@ -61,40 +81,51 @@ class PandasDatasetClient(IDatasetRepository):
         The 'Business Logic'. 
         Converts raw DataFrame -> Clean Domain Model.
         """
-        columns = []
+        columns: List[ColumnProfile] = []
         
-        for col_name in df.columns:
-            series = df[col_name]
+        # Iterate by index to avoid issues with duplicate column names
+        for i in range(len(df.columns)):
+            col_name = df.columns[i]
+            series = df.iloc[:, i]
             
             # 1. Map Pandas Dtypes to simple strings
             dtype = str(series.dtype)
             
             # 2. Calculate Missing %
-            missing_count = series.isnull().sum()
+            missing_sum = series.isnull().sum()
+            missing_count = int(cast(Any, missing_sum))
             total_count = len(df)
             missing_pct = (missing_count / total_count) * 100 if total_count > 0 else 0.0
 
             # 3. Calculate Stats for Numeric Columns
-            mean_val = None
-            std_val = None
-            min_val = None
-            max_val = None
-            outlier_count = None
+            mean_val: Optional[float] = None
+            std_val: Optional[float] = None
+            min_val: Optional[float] = None
+            max_val: Optional[float] = None
+            outlier_count: Optional[int] = None
 
             if pd.api.types.is_numeric_dtype(series):
                 # Calculate basic stats (convert to native python float for JSON serialization)
                 try:
-                    mean_val = float(series.mean()) if not pd.isna(series.mean()) else None
-                    std_val = float(series.std()) if not pd.isna(series.std()) else None
-                    min_val = float(series.min()) if not pd.isna(series.min()) else None
-                    max_val = float(series.max()) if not pd.isna(series.max()) else None
+                    s_mean = series.mean()
+                    s_std = series.std()
+                    s_min = series.min()
+                    s_max = series.max()
+
+                    # Use cast to satisfy type checker that these are scalars
+                    mean_val = float(cast(Any, s_mean)) if not pd.isna(s_mean) else None
+                    std_val = float(cast(Any, s_std)) if not pd.isna(s_std) else None
+                    min_val = float(cast(Any, s_min)) if not pd.isna(s_min) else None
+                    max_val = float(cast(Any, s_max)) if not pd.isna(s_max) else None
                     
                     # Calculate Outliers (IQR Method)
                     # We drop NAs for quantile calculation to avoid issues
                     valid_data = series.dropna()
                     if not valid_data.empty:
-                        Q1 = valid_data.quantile(0.25)
-                        Q3 = valid_data.quantile(0.75)
+                        q1_val = valid_data.quantile(0.25)
+                        q3_val = valid_data.quantile(0.75)
+                        Q1 = float(cast(Any, q1_val))
+                        Q3 = float(cast(Any, q3_val))
                         IQR = Q3 - Q1
                         lower_bound = Q1 - 1.5 * IQR
                         upper_bound = Q3 + 1.5 * IQR
@@ -107,9 +138,9 @@ class PandasDatasetClient(IDatasetRepository):
                     pass
 
             columns.append(ColumnProfile(
-                name=col_name,
+                name=str(col_name),
                 data_type=dtype,
-                missing_percentage=round(missing_pct, 2),
+                missing_percentage=round(float(cast(Any, missing_pct)), 2),
                 mean=mean_val,
                 std=std_val,
                 min=min_val,
@@ -127,6 +158,7 @@ class PandasDatasetClient(IDatasetRepository):
             columns=columns,
             sample_data=sample
         )
+# endregion
 
 # region clean data 
 
@@ -141,11 +173,24 @@ class PandasDatasetClient(IDatasetRepository):
             # - Lowercase
             # - Replace spaces with underscores
             # - Remove special characters (keep only alphanumeric and underscores)
-            df.columns = (df.columns
+            new_cols = (df.columns
                 .str.strip()
                 .str.lower()
                 .str.replace(r'\s+', '_', regex=True)
                 .str.replace(r'[^\w]', '', regex=True))
+            
+            # Handle duplicates
+            counts: Dict[str, int] = {}
+            final_columns = []
+            for col in new_cols:
+                if col in counts:
+                    counts[col] += 1
+                    final_columns.append(f"{col}_{counts[col]}")
+                else:
+                    counts[col] = 0
+                    final_columns.append(col)
+            
+            df.columns = pd.Index(final_columns)
 
         # 2. Date Normalization
         if options.date_columns:
@@ -160,6 +205,7 @@ class PandasDatasetClient(IDatasetRepository):
                         # Apply target string format
                         # Note: This converts the column to Object/String type
                         if date_cfg.output_format:
+                            # Use .dt accessor explicitly
                             df[col] = df[col].dt.strftime(date_cfg.output_format)
                     except Exception:
                         # If a column is completely incompatible, we skip it to prevent crashing
@@ -189,8 +235,9 @@ class PandasDatasetClient(IDatasetRepository):
             # Strategy: FILL MODE (Most Frequent)
             elif strategy == "mode":
                 # mode() returns a Series (there can be ties), so we take the first one ([0])
-                if not df[column].mode().empty:
-                    mode_val = df[column].mode()[0]
+                col_mode = df[column].mode()
+                if not col_mode.empty:
+                    mode_val = col_mode.iloc[0]
                     df[column] = df[column].fillna(mode_val)
 
             # Strategy: FILL UNKNOWN
@@ -202,3 +249,4 @@ class PandasDatasetClient(IDatasetRepository):
         overview = self.analyze(df)
 
         return df, overview
+# endregion

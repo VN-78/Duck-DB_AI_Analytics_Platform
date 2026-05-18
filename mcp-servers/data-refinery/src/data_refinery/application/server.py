@@ -2,8 +2,8 @@
 from mcp.server.fastmcp import FastMCP
 import uuid
 from pathlib import Path
-# from typing import Dict, List, Any
 import json
+import logging
 
 # Domain And Infrastructure imports
 from data_refinery.domain.models.dataset import DatasetOverview
@@ -12,11 +12,16 @@ from data_refinery.domain.models.cleaning import CleaningOptions, CleaningRespon
 from data_refinery.infrastructure.pandas_client import PandasDatasetClient
 from data_refinery.infrastructure.duckdb_client import DuckDBClient
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("data-refinery")
+
 # region initialize mcp server
 mcp = FastMCP(
     name = "data-refinery",
-    # host = "localhost", provide host and port in the run command instead
-    # port = 8050,
     )
 
 client = PandasDatasetClient()
@@ -43,14 +48,18 @@ def inspect_dataset(file_uri: str) -> DatasetOverview:
             - Local: '/home/user/data/file.csv'
             - S3: 's3://my-bucket/data.csv'
     """
+    logger.info(f"Tool 'inspect_dataset' called for {file_uri}")
+    try:
+        # load the data 
+        df = client.load_data(file_uri)
 
-    # load the data 
-    df = client.load_data(file_uri)
+        # analyze the data 
+        status = client.analyze(df)
 
-    # analyze the data 
-    status = client.analyze(df)
-
-    return status
+        return status
+    except Exception as e:
+        logger.error(f"Tool 'inspect_dataset' failed: {e}")
+        raise RuntimeError(f"Inspection Failed: {str(e)}")
 
 # region run_sql_query tool
 @mcp.tool()
@@ -73,6 +82,7 @@ def run_sql_query(file_uri: str, sql_query: str) -> SQLQueryResponse:
         Correct: "SELECT name, age FROM '/app/data.csv' WHERE age > 25"
         Incorrect: "SELECT name, age FROM users WHERE age > 25"
     """
+    logger.info(f"Tool 'run_sql_query' called. Target: {file_uri}")
     # 1. Input Integrity Check
     if file_uri not in sql_query:
         # Fail fast if the agent forgot to include the file path
@@ -86,8 +96,8 @@ def run_sql_query(file_uri: str, sql_query: str) -> SQLQueryResponse:
         response = db_client.execute_and_write(sql_query)
         return response
     except Exception as e:
+        logger.error(f"Tool 'run_sql_query' failed: {e}")
         # In MCP, raising an exception usually returns a clear error to the client.
-        # This is better than returning a partial "success=False" object.
         raise RuntimeError(f"Tool Execution Error: {str(e)}")
 
 
@@ -118,6 +128,7 @@ def clean_dataset(file_uri: str, options: CleaningOptions) -> CleaningResponse:
     Returns:
         CleaningResponse: Metadata about the cleaned file (row count, new path, and column stats).
     """
+    logger.info(f"Tool 'clean_dataset' called for {file_uri}")
     try:
         # 1. Load the data
         df = client.load_data(file_uri)
@@ -158,65 +169,131 @@ def clean_dataset(file_uri: str, options: CleaningOptions) -> CleaningResponse:
         )
 
     except Exception as e:
+        logger.error(f"Tool 'clean_dataset' failed: {e}")
         raise RuntimeError(f"Cleaning Failed: {str(e)}")
 
 # region generate_visualization
 @mcp.tool()
-def generate_visualization(file_uri: str, chart_type: str, x_column: str, y_column: str = "") -> str:
+def generate_visualization(file_uri: str, chart_type: str, x_column: str, y_column: str = "", title: str = "") -> str:
     """
-    Generates an interactive chart specification from a dataset for the frontend to render.
-    Call this tool when the user asks for a chart, plot, or graph.
-
+    Generates a full Vega-Lite JSON specification for a dataset.
+    
+    CRITICAL: Always run 'inspect_dataset' first to confirm column names and types before calling this tool.
+    
     Args:
-        file_uri: The absolute path to the input file (e.g., 's3://bucket/data.csv' or local path).
-        chart_type: MUST be one of: 'bar', 'line', 'scatter', 'pie'.
-        x_column: The column name to use for the X-axis (or labels for pie charts).
-        y_column: The column name to use for the Y-axis (or values for pie charts). Can be empty if counting.
+        file_uri: The absolute path or S3 URI to the dataset (e.g., 's3://bucket/data.csv').
+        chart_type: The type of chart to generate. MUST be one of: 'bar', 'line', 'scatter', or 'pie'.
+        x_column: The column name for the X-axis (categorical for 'bar'/'pie', numeric for 'scatter'/'line').
+        y_column: The column name for the Y-axis (must be numeric). If empty, the tool will automatically perform a 'count(*)' aggregation on x_column.
+        title: A descriptive title for the chart.
         
-    Returns:
-        A JSON string containing the chart configuration and data points (up to 100 rows).
+    Usage Notes:
+    - For 'bar' and 'pie' charts, if y_column is omitted, it creates a frequency distribution of x_column.
+    - The tool automatically samples the first 1000 rows to ensure frontend performance.
     """
     try:
-        import numpy as np
+        import duckdb
         
-        df = client.load_data(file_uri)
+        logger.info(f"Generating {chart_type} visualization for {file_uri}. X: {x_column}, Y: {y_column}")
         
-        # Drop NaNs in relevant columns to avoid JSON serialization errors
-        cols_to_keep = [x_column]
-        if y_column and y_column in df.columns:
-            cols_to_keep.append(y_column)
-            
-        df_subset = df[cols_to_keep].dropna().head(100)
+        conn = duckdb.connect(database=':memory:')
+        db_client._configure_s3(conn)
         
-        def safe_cast(val):
-            if isinstance(val, (np.integer, int)):
-                return int(val)
-            if isinstance(val, (np.floating, float)):
-                return float(val)
-            return str(val)
+        # 1. Fetch Data
+        # Sample/Aggregate data (Limit to 1000 rows for browser stability)
+        try:
+            if not y_column:
+                logger.info(f"No Y column provided. Performing COUNT aggregation on {x_column}")
+                # Use double quotes for column names to handle spaces/special characters
+                sql = f"SELECT \"{x_column}\", count(*) as count_val FROM '{file_uri}' GROUP BY \"{x_column}\" ORDER BY count_val DESC LIMIT 1000"
+                x_col_final = x_column
+                y_col_final = "count_val"
+            else:
+                logger.info(f"Y column provided: {y_column}. Selecting both.")
+                sql = f"SELECT \"{x_column}\", \"{y_column}\" FROM '{file_uri}' LIMIT 1000"
+                x_col_final = x_column
+                y_col_final = y_column
+                
+            rel = conn.sql(sql)
+            columns = rel.columns
+            rows = rel.fetchall()
+            data_values = [dict(zip(columns, row)) for row in rows]
+            logger.info(f"Successfully retrieved {len(data_values)} data points for visualization.")
+        except Exception as e:
+            logger.error(f"SQL execution failed for visualization: {e}")
+            raise
+        finally:
+            conn.close()
 
-        data = []
-        for _, row in df_subset.iterrows():
-            point = {x_column: safe_cast(row[x_column])}
-            if y_column and y_column in df.columns:
-                point[y_column] = safe_cast(row[y_column])
-            data.append(point)
-            
-        chart_spec = {
-            "type": "visualization",
-            "chart_type": chart_type,
-            "x_column": x_column,
-            "y_column": y_column,
-            "data": data
+        # 2. Map to Vega-Lite Schema
+        vega_type_map = {
+            "bar": "bar",
+            "line": "line",
+            "scatter": "point",
+            "pie": "arc"
         }
         
-        return json.dumps(chart_spec)
+        mark = vega_type_map.get(chart_type, "bar")
+        
+        spec = {
+            "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
+            "title": title or f"{chart_type.capitalize()} Chart",
+            "width": "container",
+            "height": 300,
+            "data": {"name": "table"},
+            "mark": {"type": mark, "tooltip": True},
+            "encoding": {
+                "x": {"field": x_col_final, "type": "nominal" if chart_type in ["bar", "pie"] else "quantitative", "axis": {"labelAngle": -45}},
+                "y": {"field": y_col_final, "type": "quantitative"}
+            }
+        }
+        
+        # Adjust for Pie Charts
+        if chart_type == "pie":
+            spec["encoding"] = {
+                "theta": {"field": y_col_final, "type": "quantitative"},
+                "color": {"field": x_col_final, "type": "nominal"}
+            }
+        
+        # Adjust for Scatter Plots (quantitative X)
+        if chart_type == "scatter":
+            spec["encoding"]["x"]["type"] = "quantitative"
+
+        logger.info(f"Generated Vega-Lite spec for {chart_type} chart.")
+        return json.dumps({
+            "type": "vega_lite",
+            "chart_type": chart_type,
+            "data": data_values,
+            "spec": spec
+        })
         
     except Exception as e:
-        raise RuntimeError(f"Visualization Generation Failed: {str(e)}")
+        logger.error(f"Visualization tool failed: {e}")
+        raise RuntimeError(f"Vega-Lite Generation Failed: {str(e)}")
+
+# region preview_dataset
+@mcp.tool()
+def preview_dataset(file_uri: str, limit: int = 10, offset: int = 0) -> str:
+    """
+    Returns a portion of the dataset for previewing in a table.
+    
+    CRITICAL: This tool uses DuckDB to efficiently fetch a window of rows.
+    Use this for paginated table views.
+    
+    Args:
+        file_uri: The absolute path or S3 URI to the file.
+        limit: The number of rows to return (default: 10).
+        offset: The number of rows to skip (default: 0).
+    """
+    try:
+        logger.info(f"Tool 'preview_dataset' called for {file_uri} (limit={limit}, offset={offset})")
+        preview = db_client.query_preview(file_uri, limit, offset)
+        return json.dumps(preview)
+    except Exception as e:
+        logger.error(f"Tool 'preview_dataset' failed: {e}")
+        raise RuntimeError(f"Preview Generation Failed: {str(e)}")
 
 
 # region main
 if __name__ == "__main__":
     mcp.run(transport="stdio")
-

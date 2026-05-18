@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import Dict, Literal, Optional
-from data_refinery.domain.models.dataset import BaseDatasetInfo, DatasetOverview
+from data_refinery.domain.models.dataset import  DatasetOverview
 
 # We define the valid strategies as a Type for clarity
 # This helps IDEs and future developers know what strings are allowed
